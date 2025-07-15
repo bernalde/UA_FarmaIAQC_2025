@@ -12,7 +12,6 @@ This module contains utility functions and classes for implementing the HP latti
 model for protein folding optimization using QAOA (Quantum Approximate Optimization Algorithm).
 """
 
-import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib
 from matplotlib.ticker import MultipleLocator, NullFormatter, MaxNLocator
@@ -24,19 +23,45 @@ from datetime import datetime
 from scipy.io import savemat
 from typing import List, Tuple, Dict, Optional, Union, Any, Callable
 import pennylane as qml
+from pennylane import numpy as np
 
 class CoordinateBased_HPLattice:
 	"""
-	A coordinate-based HP lattice model for protein folding.
+	HP Lattice Model for Protein Folding Optimization using QAOA.
 	
-	This class implements the HP (Hydrophobic-Polar) lattice model where proteins
-	are represented as chains of amino acids on a 2D lattice. Each amino acid is
-	classified as either Hydrophobic (H=1) or Polar (P=0).
+	This class implements the HP (Hydrophobic-Polar) lattice model for protein folding
+	on a 2D grid. It generates QUBO (Quadratic Unconstrained Binary Optimization) 
+	formulations suitable for quantum optimization algorithms like QAOA.
+	
+	The model enforces:
+	- Even amino acids can only occupy even lattice sites (checkerboard constraint)
+	- Odd amino acids can only occupy odd lattice sites  
+	- Connectivity between consecutive amino acids (Manhattan distance = 1)
+	- No overlaps (self-avoidance)
+	- Maximization of hydrophobic-hydrophobic contacts
+	
+	Attributes:
+		sequence (List[int]): Protein sequence as list of 1s (H=hydrophobic) and 0s (P=polar)
+		dim_lattice (Tuple[int, int]): Lattice dimensions (rows, columns)
+		lambda_vector (Tuple[float, float, float]): Penalty coefficients for constraints
+		max_index (Optional[int]): Maximum number of solutions to enumerate (memory control)
+		bit_name_list (List[Tuple]): Mapping of qubits to (lattice_node, amino_acid_index)
+		num_bits (int): Total number of qubits in the problem encoding
+		Q (Dict): QUBO matrix as dictionary mapping qubit pairs to energy coefficients
+		O_energies (List[float]): One-body energy terms (diagonal QUBO elements)
+		T_energies (np.ndarray): Two-body energy matrix (off-diagonal QUBO elements)
+		Dn (List[int]): Cardinality constraints for XY-mixer Hamiltonians
+		solution_set (List[np.ndarray]): All possible 2^n binary configurations
+		feasible_set (List[np.ndarray]): Physically valid protein configurations
+		
+	Note:
+		Based on code by Lucas Knuthson. For citation, see:
+		Irbäck et al. 2022: https://journals.aps.org/prresearch/abstract/10.1103/PhysRevResearch.4.043013
 	"""
-	
+
 	def __init__(self, sequence: List[int], dim_lattice: Tuple[int, int], 
-				 lambda_vector: Tuple[float, float, float], max_index: Optional[int] = None, 
-				 verbose: bool = False) -> None:
+				lambda_vector: Tuple[float, float, float], max_index: Optional[int] = None, 
+				verbose: bool = False) -> None:
 		"""
 		Initialize the HP lattice protein folding problem.
 		
@@ -55,7 +80,7 @@ class CoordinateBased_HPLattice:
 		# Initialize derived properties
 		self.bit_name_list = self.get_bit_names()
 		self.num_bits = len(self.bit_name_list)
-		self.Q = self.get_QUBO_matrix(verbose=verbose)
+		self.Q = self.make_Q()
 		self.O_energies = self.get_O_energies()
 		self.T_energies = self.get_T_energies()
 		self.Dn = self.get_Dn()
@@ -71,12 +96,12 @@ class CoordinateBased_HPLattice:
 		"""
 		String representation of the CoordinateBased_HPLattice object.
 		Returns a string summarizing the one-body and two-body energies.
-		
+
 		Returns:
 			str: String representation showing one-body (O) and two-body (T) energies
 		"""
 		return '\nO:\n' + str(self.O_energies) + '\nT:\n' + str(self.T_energies)
-	
+
 	def print_summary(self) -> None:
 		"""
 		Print a comprehensive summary of the protein folding problem setup.
@@ -103,511 +128,811 @@ class CoordinateBased_HPLattice:
 		print(f"Feasible solutions: {len(self.feasible_set)}")
 		print(f"Feasible percentage: {self.get_feasible_percentage():.2f}%")
 
-	def get_QUBO_matrix(self, verbose: bool = False) -> Dict[Tuple[Tuple[int, int], Tuple[int, int]], float]:
+	def get_H_indices(self) -> Tuple[List[int], List[int]]:
 		"""
-		Generate the QUBO (Quadratic Unconstrained Binary Optimization) matrix.
+		Get indices of hydrophobic amino acids separated by even/odd positions.
 		
-		The QUBO formulation includes:
-		- HP interactions (maximize H-H contacts)
-		- One-per constraints (each position occupied by exactly one amino acid)
-		- Self-avoidance (no overlaps)
-		- Connectivity (consecutive amino acids must be adjacent)
+		Identifies the positions of hydrophobic (H=1) amino acids in the sequence,
+		separated into even and odd sequence positions. This separation is crucial
+		for the checkerboard constraint where even amino acids occupy even lattice 
+		sites and odd amino acids occupy odd lattice sites.
+		
+		Returns:
+			Tuple[List[int], List[int]]: A tuple containing:
+				- H_index_even: Indices of hydrophobic amino acids at even sequence positions
+				- H_index_odd: Indices of hydrophobic amino acids at odd sequence positions
+				
+		Note:
+			Used in make_Q() to generate hydrophobic interaction terms.
+			Based on code by Lucas Knuthson.
+		"""
+		H_index_even = [i for i in range(len(self.sequence)) if self.sequence[i] == 1 and i % 2 == 0]
+		H_index_odd = [i for i in range(len(self.sequence)) if self.sequence[i] == 1 and i % 2 == 1]
+		return H_index_even, H_index_odd
+
+	def combos_of_H(self) -> List[Tuple[int, int]]:
+		"""
+		Generate all combinations of hydrophobic amino acids between even and odd positions.
+		
+		Creates pairs of hydrophobic amino acids where one is at an even sequence position
+		and the other is at an odd position. These combinations are used to generate
+		favorable hydrophobic interaction terms in the QUBO matrix.
+		
+		Returns:
+			List[Tuple[int, int]]: List of (even_H_index, odd_H_index) pairs representing
+								   all possible hydrophobic interactions between even/odd positions
+								   
+		Note:
+			Used in make_Q() to generate HP (hydrophobic-hydrophobic) interaction terms.
+			Only considers non-adjacent amino acids for interaction energy.
+			Based on code by Lucas Knuthson.
+		"""
+		H_index_even, H_index_odd = self.get_H_indices()
+		H_combos = []
+		for even in H_index_even:
+			for odd in H_index_odd:
+				H_combos.append((even, odd))
+		return H_combos
+
+	def split_evenodd(self) -> Tuple[List[int], List[int]]:
+		"""
+		Split sequence indices into even and odd position categories.
+		
+		Separates the amino acid sequence indices based on their position parity.
+		This separation is fundamental to the checkerboard constraint structure
+		of the HP lattice model where even/odd amino acids can only occupy
+		corresponding even/odd lattice sites.
+		
+		Returns:
+			Tuple[List[int], List[int]]: A tuple containing:
+				- cates_even: Indices of amino acids at even sequence positions (0, 2, 4, ...)
+				- cates_odd: Indices of amino acids at odd sequence positions (1, 3, 5, ...)
+				
+		Note:
+			Used throughout make_Q() to enforce proper constraint structure.
+			The term "cates" is short for "categories".
+			Based on code by Lucas Knuthson.
+		"""
+		cates_even = [i for i in range(len(self.sequence)) if i%2 == 0]
+		cates_odd = [i for i in range(len(self.sequence)) if i%2 == 1]
+		return cates_even, cates_odd
+
+	def make_Q(self, verbose: bool = False) -> Dict[Tuple[Tuple[Tuple[int, int], int], Tuple[Tuple[int, int], int]], float]:
+		"""
+		Generate the QUBO (Quadratic Unconstrained Binary Optimization) matrix for the HP lattice model.
+		
+		Constructs the complete energy function for protein folding optimization by combining:
+		1. Hydrophobic interaction terms (negative energy for H-H contacts)
+		2. One-per constraints (each amino acid occupies exactly one position) 
+		3. Self-avoidance constraints (no position overlaps)
+		4. Connectivity constraints (adjacent amino acids must be neighbors)
 		
 		Args:
-			verbose (bool): If True, prints debugging information about constraint counts. Default: False
+			verbose (bool, optional): If True, prints detailed constraint counts. Default: False
 			
 		Returns:
-			Dict[Tuple[Tuple[int, int], Tuple[int, int]], float]: QUBO matrix as dictionary where
-				keys are tuples of ((node1, seq1), (node2, seq2)) and values are energy coefficients
+			Dict: QUBO matrix as dictionary where keys are tuples of bit pairs
+				  ((node1, seq1), (node2, seq2)) and values are energy coefficients.
+				  Diagonal terms represent one-body energies, off-diagonal terms
+				  represent two-body interactions.
+				  
+		QUBO Structure:
+			- HP interactions: Negative terms favoring hydrophobic contacts
+			- Lambda 1 (one-per): Ensures exactly one amino acid per sequence position  
+			- Lambda 2 (self-avoidance): Penalizes multiple amino acids at same lattice site
+			- Lambda 3 (connectivity): Enforces adjacency between consecutive amino acids
+			
+		Note:
+			The bit format is (node, seq_index) where node=(row, col) and seq_index
+			is the position in the protein sequence. Based on code by Lucas Knuthson.
 		"""
 		from collections import defaultdict
-		
-		Q = defaultdict(float)
-		(L1, L2) = self.dim_lattice
-		G = nx.grid_2d_graph(L1, L2)
-		
-		# Count for debugging
-		count_HP = count_onper = count_sa = count_con = 0
-		
-		# HP interaction term (negative to favor H-H contacts)
-		for u in G.nodes():
-			for v in G.neighbors(u):
-				for i in range(len(self.sequence)):
-					for j in range(len(self.sequence)):
-						if (self.sequence[i] == 1 and self.sequence[j] == 1 and 
-							abs(i - j) != 1):  # Not consecutive amino acids
-							Q[((u, i), (v, j))] -= 1
-							count_HP += 1
-		
-		# One-per constraints
-		cates_even = [x for x in range(len(self.sequence)) if x % 2 == 0]
-		cates_odd = [x for x in range(len(self.sequence)) if x % 2 != 0]
-		
-		# Even positions
+		Q = defaultdict(int)
+
+		cates_even, cates_odd = self.split_evenodd()
+
+		G = nx.grid_2d_graph(self.dim_lattice[0], self.dim_lattice[1]) # makes a lattice as a graph
+
+		# EPH
+		H_combos = self.combos_of_H()
+		count_HP = 0
+		#print('HP')
+		for u,v in G.edges():
+			for x,y in H_combos:
+				if (x-y)**2 > 4:
+					if sum(u) % 2 != 1 and sum(v) % 2 == 1:
+						Q[((u,x), (v,y))] -= 1
+						count_HP += 1
+						#print('-', ((u,x), (v,y)))
+					elif sum(u) % 2 == 1 and sum(v) % 2 != 1:
+						Q[((v,x), (u,y))] -= 1
+						count_HP += 1
+						#print('-', ((v,x), (u,y)))
+					
+		# Sums over the squared sums, lambda 1
+		count_onper = 0
+		#print('Sums over the squared sums')
+		#even
 		for i in cates_even:
+			# One body
 			for u in G.nodes():
-				if sum(u) % 2 != 1:  # Even lattice sites
-					Q[((u, i), (u, i))] -= 1 * self.lambda_vector[0]
+				if sum(u) % 2 != 1:
+					Q[((u,i), (u,i))] -= 1*self.lambda_vector[0]
 					count_onper += 1
-			
+					#print('-', ((u,i), (u,i)))
+
+			# Two body
 			for u in G.nodes():
 				for v in G.nodes():
-					if (u != v and sum(u) % 2 != 1 and sum(v) % 2 != 1):
-						Q[((u, i), (v, i))] += 2 * self.lambda_vector[0]
+					if u != v and (sum(u) % 2 != 1 and sum(v) % 2 != 1) :
+						Q[((u,i),(v,i))] += 2*self.lambda_vector[0]
 						count_onper += 1
-		
-		# Odd positions
+						#print(((u,i),(v,i)))
+
+		#odd
 		for i in cates_odd:
+			# One body
 			for u in G.nodes():
-				if sum(u) % 2 == 1:  # Odd lattice sites
-					Q[((u, i), (u, i))] -= 1 * self.lambda_vector[0]
+				if sum(u) % 2 == 1:
+					Q[((u,i),(u,i))] -= 1*self.lambda_vector[0]
 					count_onper += 1
-			
+					#print('-', ((u,i),(u,i)))
+
+			# Two body
 			for u in G.nodes():
 				for v in G.nodes():
-					if (u != v and sum(u) % 2 == 1 and sum(v) % 2 == 1):
-						Q[((u, i), (v, i))] += 2 * self.lambda_vector[0]
+					if u != v and (sum(u) % 2 == 1 and sum(v) % 2 == 1):
+						Q[((u,i),(v,i))] += 2*self.lambda_vector[0]
 						count_onper += 1
-		
-		# Self-avoidance constraints
+						#print(((u,i),(v,i)))
+
+		# self-avoidance, lambda 2
+		#print('self-avoidance')
+		count_sa = 0
 		for u in G.nodes():
-			if sum(u) % 2 != 1:  # Even sites
+			if sum(u) % 2 != 1: # even beads
 				for x in cates_even:
 					for y in cates_even:
 						if x != y and x < y:
-							Q[((u, x), (u, y))] += 1 * self.lambda_vector[1]
+							Q[((u,x), (u,y))] += 1*self.lambda_vector[1]
 							count_sa += 1
-			elif sum(u) % 2 == 1:  # Odd sites
+							#print(((u,x), (u,y)))
+			elif sum(u) % 2 == 1: # odd beads
 				for x in cates_odd:
 					for y in cates_odd:
 						if x != y and x < y:
-							Q[((u, x), (u, y))] += 1 * self.lambda_vector[1]
+							Q[((u,x), (u,y))] += 1*self.lambda_vector[1]
 							count_sa += 1
-		
-		# Connectivity constraints
+							#print(((u,x), (u,y)))
+
+		# Connectivity sums, lambda 3
+		# Even
+		#print('Connectivity sums')
+		count_con = 0
 		for i in cates_even:
 			for u in G.nodes():
 				for v in G.nodes():
-					if (((u, v) not in G.edges()) and ((v, u) not in G.edges()) and u != v):
-						if (sum(u) % 2 != 1 and sum(v) % 2 == 1):
-							if len(self.sequence) % 2 == 0:
-								Q[((u, i), (v, i + 1))] += 1 * self.lambda_vector[2]
+					if (((u,v) in G.edges()) == False and ((v,u) in G.edges()) == False) and u != v:
+						if sum(u) % 2 != 1 and sum(v) % 2 == 1 and len(self.sequence) % 2 == 0:
+							count_con += 1
+							#print(((u,i), (v,i+1)))
+							Q[((u,i), (v,i+1))] += 1*self.lambda_vector[2]
+
+						elif sum(u) % 2 != 1 and sum(v) % 2 == 1 and len(self.sequence) % 2 == 1:
+							if i != cates_even[-1]:
+								Q[((u,i), (v,i+1))] += 1*self.lambda_vector[2]
 								count_con += 1
-							elif len(self.sequence) % 2 == 1 and i != cates_even[-1]:
-								Q[((u, i), (v, i + 1))] += 1 * self.lambda_vector[2]
-								count_con += 1
-		
+								#print(((u,i), (v,i+1)))
+		# Odd
 		for i in cates_odd:
 			for u in G.nodes():
 				for v in G.nodes():
-					if (((u, v) not in G.edges()) and ((v, u) not in G.edges()) and u != v):
-						if (sum(u) % 2 != 1 and sum(v) % 2 == 1):
-							if len(self.sequence) % 2 == 1:
-								Q[((u, i + 1), (v, i))] += 1 * self.lambda_vector[2]
+					if (((u,v) in G.edges()) == False and ((v,u) in G.edges()) == False) and u != v:
+						if (sum(u) % 2 != 1 and sum(v) % 2 == 1) and len(self.sequence) % 2 == 1:
+							Q[((u,i+1), (v,i))] += 1*self.lambda_vector[2]
+							count_con += 1
+							#print(((u,i+1), (v,i)))
+
+						elif (sum(u) % 2 != 1 and sum(v) % 2 == 1) and len(self.sequence) % 2 == 0:
+							if i != cates_odd[-1]:
 								count_con += 1
-							elif len(self.sequence) % 2 == 0 and i != cates_odd[-1]:
-								Q[((u, i + 1), (v, i))] += 1 * self.lambda_vector[2]
-								count_con += 1
-		
+								#print(((u,i+1), (v,i)))
+								Q[((u,i+1), (v,i))] += 1*self.lambda_vector[2]
+
 		if verbose:
-			print('QUBO matrix construction counts:')
-			print(f'HP interactions: {count_HP}')
-			print(f'One-per constraints (lambda 1): {count_onper}')
-			print(f'Self-avoidance (lambda 2): {count_sa}')
-			print(f'Connectivity (lambda 3): {count_con}')
-		
-		return dict(Q)  # Convert to regular dict
+			print('Counts:')
+			print('HP: ', count_HP)
+			print('onper, lambda 1: ', count_onper)
+			print('self-avoidance, lambda 2: ', count_sa)
+			print('connectivity, lambda 3: ', count_con)
+
+		Q = dict(Q) # not a defaultdict anymore to not be able to grow by error
+		return Q
 
 	def get_node_list(self, verbose: bool = False) -> List[Tuple[int, int]]:
 		"""
-		Get the list of lattice nodes in snake-like (serpentine) order.
+		Generate an ordered list of lattice nodes in serpentine (snake-like) pattern.
 		
-		Creates an ordering of lattice nodes that follows a serpentine pattern:
-		even rows go left-to-right, odd rows go right-to-left. This ordering
-		is used to establish a canonical mapping between lattice positions
-		and qubit indices.
+		Creates a systematic ordering of all lattice positions following a serpentine path:
+		even rows proceed left-to-right, odd rows proceed right-to-left. This ordering
+		maintains spatial locality and provides a canonical mapping between lattice
+		positions and qubit indices.
 		
 		Args:
-			verbose (bool): If True, saves a visualization of the lattice
-							and prints the node ordering. Default: False
-							
+			verbose (bool, optional): If True, saves lattice visualization and prints node list. Default: False
+			
 		Returns:
-			List[Tuple[int, int]]: Ordered list of (row, col) tuples representing lattice nodes
-								   in serpentine order
-								  
+			List[Tuple[int, int]]: Ordered list of (row, col) lattice coordinates in serpentine order
+			
+		Serpentine Pattern Example (3x3 lattice):
+			(0,0) → (0,1) → (0,2)
+			(1,2) ← (1,1) ← (1,0)  
+			(2,0) → (2,1) → (2,2)
+			
 		Note:
-			The serpentine ordering helps maintain spatial locality in the
-			qubit mapping, which can be beneficial for quantum circuit implementation.
+			Serpentine ordering helps maintain spatial locality in qubit assignments,
+			which can be beneficial for quantum circuit depth and connectivity.
 		"""
 		node_list = []
 		(Lrow, Lcol) = self.dim_lattice
 		G = nx.grid_2d_graph(Lrow, Lcol)
-		
+
 		for row in range(Lrow):
 			start_index = row * Lcol
-			if row % 2 == 0:  # Even row: forward
+			if row % 2 == 0: # even row is forward
 				node_list.extend(list(G.nodes())[start_index:start_index + Lcol])
-			else:  # Odd row: backward
+			if row % 2 == 1: # odd row is backward
 				node_list.extend(reversed(list(G.nodes())[start_index:start_index + Lcol]))
-		
 		if verbose:
 			nx.draw(G, with_labels=True)
-			plt.savefig('Lattice.png')
-			print(f"Node list: {node_list}")
-		
+			plt.savefig('Lattice')
+			print(node_list)
 		return node_list
 
 	def get_bit_names(self) -> List[Tuple[Tuple[int, int], int]]:
 		"""
-		Generate bit names mapping qubits to (lattice_node, amino_acid_index) pairs.
+		Generate systematic mapping between qubits and protein folding variables.
 		
-		Creates a systematic mapping between qubit indices and protein folding
-		variables. Each bit represents placing a specific amino acid at a specific
-		lattice position, following the constraint that even amino acids can only
-		occupy even lattice sites and odd amino acids only odd sites.
+		Creates a canonical mapping from qubit indices to (lattice_position, amino_acid_index) pairs.
+		The mapping respects the checkerboard constraint: even amino acids are assigned to
+		even lattice sites, odd amino acids to odd lattice sites. This reduces the Hilbert
+		space size and enforces physical constraints at the encoding level.
 		
 		Returns:
-			List[Tuple[Tuple[int, int], int]]: List of tuples where each element is 
-				((row, col), amino_acid_index) representing the mapping from qubits 
-				to protein folding variables
-				  
-		Note:
-			The ordering respects the even/odd constraints: bits for even amino acids
-			are assigned to even lattice sites first, then bits for odd amino acids
-			to odd lattice sites. This reduces the problem's Hilbert space.
+			List[Tuple[Tuple[int, int], int]]: List where each element is ((row, col), seq_index)
+				representing the qubit-to-variable mapping. The ordering determines which
+				qubit corresponds to placing which amino acid at which lattice position.
+				
+		Encoding Structure:
+			- First, all even amino acids (0, 2, 4, ...) assigned to even lattice sites
+			- Then, all odd amino acids (1, 3, 5, ...) assigned to odd lattice sites
+			- Lattice sites ordered according to serpentine pattern from get_node_list()
+			
+		Example:
+			For sequence [H,P,H] on 2x2 lattice:
+			- Qubit 0: ((0,0), 0) = amino acid 0 at position (0,0) [even site]
+			- Qubit 1: ((0,2), 0) = amino acid 0 at position (0,2) [even site]  
+			- Qubit 2: ((0,1), 1) = amino acid 1 at position (0,1) [odd site]
+			- Qubit 3: ((1,1), 1) = amino acid 1 at position (1,1) [odd site]
+			- etc.
 		"""
+
 		seq_index = range(len(self.sequence))
-		node_list = self.get_node_list(verbose=False)
+		node_list = self.get_node_list(verbose = False)
 		bit_name_list = []
-		L_2 = int(self.dim_lattice[0] * self.dim_lattice[1])
-		
+		L_2 = int(self.dim_lattice[0]*self.dim_lattice[1])
 		nodes_even = [x for x in range(L_2) if x % 2 == 0]
 		nodes_odd = [x for x in range(L_2) if x % 2 != 0]
-		
+		# for all even nodes with first index aso
 		for f in seq_index:
-			if f % 2 == 0:  # Even sequence positions
+			if f % 2 == 0:
 				for s in nodes_even:
 					bit_name_list.append((node_list[s], f))
-			else:  # Odd sequence positions
+			if f % 2 == 1:
 				for s in nodes_odd:
 					bit_name_list.append((node_list[s], f))
-		
 		return bit_name_list
 
 	def get_O_energies(self) -> List[float]:
 		"""
 		Extract one-body energy terms from the QUBO matrix.
 		
-		One-body terms correspond to diagonal elements of the QUBO matrix,
-		representing local energy contributions for each qubit. These terms
-		arise from penalty constraints and local field effects in the 
-		optimization formulation.
+		Retrieves diagonal elements of the QUBO matrix, which represent local energy
+		contributions for individual qubits. These terms arise primarily from
+		penalty constraints that enforce structural requirements.
 		
 		Returns:
-			List[float]: One-body energy coefficients for each qubit, where
-				  missing diagonal terms default to 0.0
-				  
+			List[float]: One-body energy coefficients for each qubit. Missing diagonal
+						 terms are treated as 0.0. These form the σᵢᶻ terms in the
+						 cost Hamiltonian: Σᵢ hᵢ σᵢᶻ
+						 
+		Physical Interpretation:
+			- Positive values: Energetic penalty for activating this qubit
+			- Negative values: Energetic preference for activating this qubit  
+			- Zero values: No local energy bias for this qubit
+			
 		Note:
-			These energies are used to construct the σ^z terms in the 
-			cost Hamiltonian: Σᵢ hᵢ σᵢ^z. In the HP lattice model, they
-			primarily come from one-per constraints that ensure each
-			amino acid occupies exactly one lattice site.
+			In the HP lattice model, these primarily come from one-per constraints
+			(lambda_1 terms) that ensure each amino acid occupies exactly one position.
 		"""
 		O_energies = []
 		for bit in self.bit_name_list:
 			try:
 				O_energies.append(self.Q[(bit, bit)])
-			except KeyError:
-				O_energies.append(0.0)
+			except:
+				pass
 		return O_energies
 
 	def get_T_energies(self) -> np.ndarray:
 		"""
-		Extract two-body energy terms from the QUBO matrix.
+		Extract two-body interaction terms from the QUBO matrix.
 		
-		Two-body terms represent interactions between different qubits,
-		forming the off-diagonal elements of the QUBO matrix. These capture
-		the coupling between different amino acid placements and include
-		HP interactions, connectivity constraints, and overlap penalties.
+		Constructs a symmetric matrix containing all pairwise qubit interactions
+		from the off-diagonal elements of the QUBO matrix. These terms capture
+		the coupling between different amino acid placements and include physical
+		interactions and constraint penalties.
 		
 		Returns:
-			np.ndarray: Symmetric matrix of two-body interaction energies
-						where T[i,j] represents the coupling between qubits i and j.
-						Shape is (num_bits, num_bits) with T[i,j] = T[j,i].
+			np.ndarray: Symmetric matrix of shape (num_bits, num_bits) where T[i,j]
+						represents the interaction energy between qubits i and j.
+						Diagonal elements are zero (handled by one-body terms).
 						
+		Physical Interpretation:
+			- Negative values: Favorable interactions (e.g., H-H contacts)
+			- Positive values: Unfavorable interactions or constraint violations
+			- Zero values: No direct interaction between these qubits
+			
+		Matrix Construction:
+			1. Fills upper triangle from QUBO off-diagonal terms
+			2. Symmetrizes: T[i,j] = T[j,i] for all i,j
+			3. Sets diagonal to zero (one-body terms handled separately)
+			
 		Note:
-			The resulting matrix is symmetrized to ensure T[i,j] = T[j,i].
-			These energies construct the σᵢ^z σⱼ^z terms in the cost Hamiltonian.
-			In protein folding, they encode physical interactions like hydrophobic
-			contacts (favorable) and constraint violations (penalized).
+			Forms the σᵢᶻσⱼᶻ terms in the cost Hamiltonian: Σᵢ<ⱼ Jᵢⱼ σᵢᶻσⱼᶻ
 		"""
 		T_energies = np.zeros((self.num_bits, self.num_bits))
-		
+
 		for j in range(self.num_bits):
 			for k in range(self.num_bits):
-				if j != k:
+				if j == k:
+					T_energies[j,k] = 0
+				else:
 					try:
-						energy = self.Q.get((self.bit_name_list[j], self.bit_name_list[k]), 0.0)
-						T_energies[j, k] = energy
-					except KeyError:
+						T_energies[j,k] = self.Q[self.bit_name_list[j], self.bit_name_list[k]]
+						if j > k:
+							T_energies[k,j] = self.Q[self.bit_name_list[j], self.bit_name_list[k]]
+					except:
 						pass
-		
-		# Make symmetric
-		T_energies = np.triu(T_energies)
-		T_energies = T_energies + T_energies.T - np.diag(np.diag(T_energies))
+
+		T_energies = np.triu(T_energies) # delete lower triangle
+		T_energies = T_energies + T_energies.T - np.diag(np.diag(T_energies)) # copy upper triangle to lower triangle
 		return T_energies
 
 	def get_Dn(self) -> List[int]:
 		"""
-		Get cardinality constraints for XY-mixer implementation.
+		Calculate cardinality constraints for XY-mixer Hamiltonian construction.
 		
-		Calculates the number of available lattice sites for even and odd
-		amino acid positions, used for constructing XY-mixer Hamiltonians
-		that preserve the Hamming weight within each subspace. This enforces
-		the bipartite constraint structure of the HP lattice model.
+		Determines the number of available lattice sites for each amino acid position,
+		accounting for the even/odd checkerboard constraint. These cardinality values
+		are essential for constructing XY-mixer Hamiltonians that preserve the
+		Hamming weight within each amino acid subspace.
 		
 		Returns:
-			List[int]: Cardinality values for each amino acid position, where
-				  even positions get ceiling(total_sites/2) sites and
-				  odd positions get floor(total_sites/2) sites
-				  
+			List[int]: Cardinality values for each amino acid position, where:
+					   - Even positions: ceil(total_sites/2) available sites
+					   - Odd positions: floor(total_sites/2) available sites
+					   
+		Constraint Structure:
+			- Even amino acids (0, 2, 4, ...) can only occupy even lattice sites
+			- Odd amino acids (1, 3, 5, ...) can only occupy odd lattice sites  
+			- This reduces the Hilbert space by factor 2^(sequence_length)
+			
+		Example:
+			For 3x3 lattice (9 sites total):
+			- Even amino acids: 5 available sites (ceil(9/2))
+			- Odd amino acids: 4 available sites (floor(9/2))
+			
 		Note:
-			This enforces the constraint that even amino acids can only
-			occupy even lattice sites and odd amino acids only odd sites,
-			reducing the Hilbert space size by a factor of 2^(sequence_length).
-			Essential for constructing constrained mixers in QAOA.
+			Critical for QAOA implementations using constrained mixers that
+			preserve feasibility throughout the optimization process.
 		"""
 		D = []
 		for seq in range(len(self.sequence)):
 			if seq % 2 == 0:
-				D.append(math.ceil((self.dim_lattice[0] * self.dim_lattice[1]) / 2))
-			else:
-				D.append(math.floor((self.dim_lattice[0] * self.dim_lattice[1]) / 2))
+				D.append(math.ceil((self.dim_lattice[0]*self.dim_lattice[1])/2))
+			if seq % 2 == 1:
+				D.append(math.floor((self.dim_lattice[0]*self.dim_lattice[1])/2))
 		return D
 
 	def get_feasible_percentage(self) -> float:
 		"""
-		Calculate the percentage of solutions that are physically feasible.
+		Calculate the percentage of solutions that satisfy all physical constraints.
 		
-		This metric provides insight into the constraint complexity of the
-		protein folding problem. A lower percentage indicates tighter constraints
-		and a more challenging optimization landscape, while higher percentages
-		suggest more flexibility in solution space.
+		Computes the ratio of feasible protein configurations to the total number
+		of possible binary states. This metric provides insight into the constraint
+		complexity and optimization difficulty of the protein folding problem.
 		
 		Returns:
-			float: Percentage of feasible solutions out of all possible 2^n states,
-				   where n is the number of qubits (bits in the problem encoding)
+			float: Percentage of feasible solutions out of all 2^n possible states
+			
+		Interpretation:
+			- Low percentage (<1%): Highly constrained, challenging optimization
+			- High percentage (>10%): Less constrained, easier optimization
+			- Typical range: 0.1% - 5% for realistic protein sequences
 			
 		Example:
-			If 4 out of 16 possible states are feasible, returns 25.0
+			If 8 out of 256 possible states are feasible, returns 3.125%
 			
 		Note:
-			This calculation requires both solution_set and feasible_set to be
-			computed, which happens automatically during initialization. The
-			ratio indicates how constrained the optimization problem is.
+			This calculation is performed automatically during initialization
+			since both solution_set and feasible_set are computed. Useful for
+			assessing problem difficulty before running optimization algorithms.
 		"""
-		return 100 * (len(self.feasible_set) / len(self.solution_set))
+		return 100*(len(self.feasible_set)/len(self.solution_set))
 
 	def get_solution_set(self) -> List[np.ndarray]:
 		"""
 		Generate all possible binary configurations for the protein folding problem.
 		
 		Creates every possible assignment of amino acids to lattice positions,
-		represented as binary strings of length num_bits. Each configuration
-		corresponds to a computational basis state in the quantum optimization.
-		If max_index is set, only returns the first max_index solutions to limit memory usage.
+		represented as binary strings. Each configuration corresponds to a 
+		computational basis state in the quantum optimization. Memory usage
+		can be controlled using the max_index parameter.
 		
 		Returns:
-			List[np.ndarray]: List of numpy arrays, each representing a binary configuration
-				  where 1 indicates an amino acid is placed at that position and 0 indicates
-				  the position is empty. Each array has length num_bits.
-				  
+			List[np.ndarray]: List of binary arrays, each of length num_bits,
+							  representing all possible protein configurations.
+							  Total number is min(2^num_bits, max_index).
+							  
+		Bit String Interpretation:
+			- 1: Amino acid is placed at the corresponding position
+			- 0: Position is empty
+			- Each bit corresponds to a (lattice_node, amino_acid_index) pair
+			  defined by bit_name_list
+			
+		Memory Considerations:
+			- Without max_index: 2^num_bits configurations (exponential growth)
+			- With max_index: Limited to first max_index configurations
+			- Use max_index for large systems to prevent memory overflow
+			
 		Note:
-			The total number of configurations is 2^num_bits, which can be
-			very large (exponential scaling). Use max_index parameter to limit 
-			computational cost for large systems. Each configuration represents
-			one possible state in the quantum register.
+			Most configurations will be physically infeasible (violate constraints).
+			Use get_feasible_set() to obtain only valid protein foldings.
 		"""
-		if self.max_index is not None:
-			return [np.array(list(product([0, 1], repeat=self.num_bits)))[i] 
-					for i in range(min(self.max_index, 2**self.num_bits))]
-		return [np.array(i) for i in product([0, 1], repeat=self.num_bits)]
+		return [np.array(i) for i in product([0, 1], repeat = self.num_bits)]
 
 	def get_feasible_set(self) -> List[np.ndarray]:
 		"""
-		Get all feasible solutions that satisfy the protein folding constraints.
+		Generate all physically valid protein configurations that satisfy structural constraints.
 		
-		Filters the complete solution space to identify only configurations that
-		represent physically valid protein foldings. A solution is feasible if it
-		satisfies all structural constraints of the HP lattice model.
+		Filters the complete solution space to identify configurations representing
+		realistic protein foldings. Uses cardinality constraints and systematic
+		validation to ensure all physical requirements are met.
 		
 		Returns:
-			List[np.ndarray]: List of binary arrays representing feasible protein 
-				configurations. Each array encodes a valid amino acid placement
-				that satisfies all physical constraints.
-		
+			List[np.ndarray]: Binary arrays representing feasible protein configurations.
+							  Each array encodes a valid folding satisfying all constraints.
+							  
 		Feasibility Criteria:
-			1. No overlaps: Same lattice node cannot contain multiple amino acids
-			2. Connectivity: Adjacent amino acids in sequence must occupy neighboring 
-			   lattice positions (Manhattan distance = 1)
-			3. One-per constraint: Exactly one amino acid per sequence position
-			4. Lattice placement: Even amino acids on even sites, odd on odd sites
+			1. Cardinality: Each amino acid occupies exactly one lattice position
+			2. Checkerboard: Even amino acids on even sites, odd on odd sites  
+			3. No overlaps: Multiple amino acids cannot occupy the same lattice site
+			4. Connectivity: Adjacent amino acids must be lattice neighbors (Manhattan distance = 1)
 			
 		Algorithm:
-			- Generates all possible amino acid placements using cardinality constraints
-			- Tests each placement for overlap violations
-			- Verifies connectivity constraints between consecutive amino acids
-			- Returns only configurations passing all tests
+			1. Generate all valid single-amino-acid placements using Dn constraints
+			2. Create all combinations respecting cardinality limits
+			3. Check overlap violations between different amino acids
+			4. Verify connectivity constraints between consecutive amino acids
+			5. Return only configurations passing all tests
+			
+		Performance:
+			- Complexity: O(∏ᵢ Dᵢ) for cardinality generation + O(n²) validation
+			- Runtime scales with lattice size and sequence length
 			
 		Note:
-			The feasible set is typically much smaller than the full solution space,
-			often representing <1% of total configurations for realistic proteins.
-			This dramatic reduction reflects the stringent physical constraints.
+			The dramatic reduction from solution_set reflects the stringent
+			physical constraints governing realistic protein structures.
 		"""
 		feasible_list = []
 		index_list = []
 		start = 0
-		
-		# Create index groups for each amino acid position
 		for rot in self.Dn:
 			stop = start + rot
-			index_perm = list(range(start, stop))
+			index_perm = [x for x in range(start, stop)]
 			index_list.append(index_perm)
 			start = stop
-		
-		# Generate all combinations
 		comb = list(product(*index_list))
-		
 		for i in comb:
 			state = np.zeros(self.num_bits)
 			for j in i:
 				state[j] = 1
-			
+
 			feasible = True
-			
-			# Check for overlaps (same node, different amino acids)
+
+			# same node and on?
 			for b in range(self.num_bits):
-				node1 = self.bit_name_list[b][0]
-				next_idx = (b + self.dim_lattice[0] * self.dim_lattice[1]) % self.num_bits
-				node2 = self.bit_name_list[next_idx][0]
 				
-				if (node1 == node2 and state[b] and state[next_idx]):
+				node1 = self.bit_name_list[b][0]
+				node2 = self.bit_name_list[(b + self.dim_lattice[0]*self.dim_lattice[1]) % self.num_bits][0]
+				if (node1 == node2) and state[b] and state[(b + self.dim_lattice[0]*self.dim_lattice[1]) % self.num_bits]:
 					feasible = False
 					break
 			
-			# Check connectivity (adjacent amino acids must be neighbors)
+			# longer distance than 1 manhattan distance
 			if feasible:
-				active_bits = [idx for idx, val in enumerate(state) if val == 1]
-				for bit1_idx, bit1 in enumerate(active_bits[:-1]):
-					bit2 = active_bits[bit1_idx + 1]
-					node1 = self.bit_name_list[bit1][0]
-					node2 = self.bit_name_list[bit2][0]
-					
-					if self.manhattan_dist(node1, node2) > 1:
-						feasible = False
-						break
-			
+				for bit1 in range(len(state)):
+					found = False
+					if state[bit1] == 1:
+						for bit2 in range(bit1+1, len(state)):
+							if state[bit2] == 1 and not found:
+								found = True
+								node1 = self.bit_name_list[bit1][0]
+								node2 = self.bit_name_list[bit2][0]
+								if self.manhattan_dist(node1, node2) > 1:
+									feasible = False
+									break
+						else:
+							continue
 			if feasible:
 				feasible_list.append(state)
-		
 		return feasible_list
 
 	def manhattan_dist(self, node1: Tuple[int, int], node2: Tuple[int, int]) -> int:
 		"""
-		Calculate Manhattan distance between two lattice nodes.
+		Calculate Manhattan distance between two lattice positions.
 		
-		The Manhattan distance is the sum of absolute differences between
-		coordinates, representing the minimum number of lattice steps needed
-		to move from one node to another along grid edges (no diagonal moves).
+		Computes the L1 distance (sum of coordinate differences) between two lattice nodes.
+		This represents the minimum number of orthogonal lattice steps needed to move
+		from one position to another (no diagonal moves allowed).
 		
 		Args:
-			node1 (Tuple[int, int]): First lattice node coordinates (row, col)
-			node2 (Tuple[int, int]): Second lattice node coordinates (row, col)
+			node1 (Tuple[int, int]): First lattice position as (row, col)
+			node2 (Tuple[int, int]): Second lattice position as (row, col)
 			
 		Returns:
-			int: Manhattan distance between the nodes
+			int: Manhattan distance between the positions
 			
-		Example:
-			>>> manhattan_dist((0,0), (1,2)) returns 3 (|0-1| + |0-2|)
-			>>> manhattan_dist((2,3), (2,4)) returns 1 (adjacent horizontally)
-			>>> manhattan_dist((1,1), (1,1)) returns 0 (same position)
+		Examples:
+			- manhattan_dist((0,0), (0,1)) = 1 (horizontally adjacent)
+			- manhattan_dist((0,0), (1,1)) = 2 (diagonal, requires 2 steps)
+			- manhattan_dist((2,3), (2,3)) = 0 (same position)
+			
+		Physical Significance:
+			- Distance = 1: Lattice neighbors, valid for consecutive amino acids
+			- Distance > 1: Not neighbors, invalid for consecutive amino acids
+			- Distance = 0: Same position, would cause overlap violation
 			
 		Note:
-			Used for connectivity constraint checking in protein folding.
-			Adjacent amino acids must have Manhattan distance = 1.
+			Central to connectivity constraint validation in get_feasible_set().
 		"""
-		return sum(abs(a - b) for a, b in zip(node1, node2))
+		distance = 0
+		for node1_i, node2_i in zip(node1, node2):
+			distance += abs(node1_i - node2_i)
+		return int(distance)
 
-	def calc_solution_sets(self) -> None:
+	def calc_solution_sets(self):
 		"""
-		Calculate and store both complete and feasible solution sets.
+		Calculate and cache both the full solution set and feasible solution set.
 		
-		This method computes all possible binary solutions and filters them
-		to identify physically feasible protein configurations. The results
-		are stored in instance variables for later use in optimization and
-		analysis. This is useful for recomputing sets if problem parameters change.
+		This method recomputes the solution_set and feasible_set attributes by calling
+		get_solution_set() and get_feasible_set(). Useful for refreshing the cached
+		sets after parameter changes.
 		
-		Updates:
-			self.solution_set: All possible 2^n binary configurations
-			self.feasible_set: Only configurations satisfying physical constraints
+		Warning:
+			This operation can be computationally expensive for large problems as it
+			generates all 2^n possible binary configurations and filters for feasible ones.
 			
-		Note:
-			This method is typically called automatically during initialization,
-			but can be used to recalculate sets if problem parameters change
-			(e.g., lattice dimensions, sequence, or constraints).
+		Returns:
+			None: Updates self.solution_set and self.feasible_set in place
 		"""
-		self.solution_set = self.get_solution_set()
 		self.feasible_set = self.get_feasible_set()
+		self.solution_set = self.get_solution_set()
 
-	def viz_lattice(self, bit: np.ndarray) -> None:
+	def bit2energy(self, bit_array):
 		"""
-		Visualize the protein configuration on the 2D lattice.
+		Calculate the energy of a specific protein configuration.
 		
-		Creates a plot showing the protein chain folded on the lattice, with
-		amino acids colored by type (H/P) and connected by bonds. Each amino
-		acid is labeled with its sequence index for easy identification.
+		Computes the total energy for a given binary configuration by combining
+		one-body (O_energies) and two-body (T_energies) energy contributions.
+		The energy includes both the objective function (H-H contacts) and
+		penalty terms for constraint violations.
 		
 		Args:
-			bit (np.ndarray): Binary array representing the protein configuration
-							  where 1 indicates amino acid placement at positions
-							  defined by bit_name_list
-							  
-		Visualization Features:
-			- Amino acids colored by type: H (hydrophobic) and P (polar) 
-			- Chain connectivity shown with black lines between adjacent amino acids
-			- Grid overlay for lattice position reference
-			- Sequence indices displayed as white labels on each amino acid
-			- Scatter plot with large markers for clear visibility
-			
-		Display Settings:
-			- Figure size: 8×6 inches for good visibility
-			- Colormap: 'coolwarm' for H/P distinction
-			- Marker size: 1500 for clear amino acid visualization
-			- Grid: Dotted lines for lattice reference
+			bit_array: Binary array representing protein configuration where 
+				bit_array[i] = 1 means amino acid is placed at the lattice position
+				corresponding to bit_name_list[i]
+				
+		Returns:
+			float: Total energy of the configuration (lower is better for optimization)
 			
 		Note:
-			The function extracts amino acid positions from the binary representation
-			and reconstructs the spatial protein configuration. The plot title includes
-			the binary string for reference.
+			This method evaluates the QUBO energy function: E = x^T * O + x^T * T * x
+			where O are one-body terms and T is the two-body interaction matrix.
 		"""
-		x, y = [], []
+		Oe = np.dot(bit_array, self.O_energies)
+
+		Te = 0
+		for j,bit in enumerate(self.bit_name_list):
+			for k,bit in enumerate(self.bit_name_list):
+				if bit_array[j] == 1.0 and bit_array[k] == 1.0:
+					Te += self.T_energies[j,k]
+					
+		energy = Oe + Te
+		return energy
+
+	def energy_of_set(self, feasible = False, verbose = False):
+		"""
+		Calculate energies for a set of protein configurations.
 		
-		for i in range(len(self.sequence)):
-			for j in range(len(bit)):
-				if bit[j] == 1 and self.bit_name_list[j][1] == i:
-					node = self.bit_name_list[j][0]
-					x.append(node[0])
-					y.append(node[1])
-					break
+		Computes the energy values for either all possible solutions or only
+		the feasible solutions, returning energy list, labels, and the configuration
+		with lowest energy.
 		
-		plt.figure(figsize=(8, 6))
-		plt.plot(y, x, 'k-', zorder=0)  # Connect with lines
-		plt.scatter(y, x, c=self.sequence, cmap='coolwarm', s=1500, zorder=3)
+		Args:
+			feasible (bool, optional): If True, evaluates only feasible_set; 
+				if False, evaluates full solution_set. Default: False
+			verbose (bool, optional): If True, prints progress updates every 1000 
+				evaluations. Default: False
+				
+		Returns:
+			Tuple[List[float], List[str], List]: A tuple containing:
+				- energy_list: List of energy values for each configuration
+				- labels: List of string representations of configurations
+				- lowest_energy_bitstring: [best_config, index, energy] of optimal solution
+				
+		Note:
+			For invalid configurations, assigns penalty energy of 1000000.
+			Labels are cleaned string representations without spaces, commas, or periods.
+		"""
+		energy_list = []
+		labels = []
+		mem = 1000000
+		lowest_energy_bitstring = None
+		if feasible:
+			set_ = self.feasible_set
+		else:
+			set_ = self.solution_set
+		for i in range(len(set_)):
+			energy = self.bit2energy(set_[i])
+
+			if verbose and (i%1000==0):
+				print('Progress in energy calculations: ', round(100*i/len(set_), 1), '%%')
+			try:
+				energy = self.bit2energy(set_[i])
+				if energy < mem:
+					lowest_energy_bitstring = [set_[i], i, energy]
+					mem = energy
+				label = str(set_[i])
+				label = label.replace(',', '')
+				label = label.replace(' ', '')
+				label = label.replace('.', '')
+				labels.append(label)
+			except:
+				energy = 1000000
+				if not feasible:
+					label = str(set_[i])
+					label = label.replace(',', '')
+					label = label.replace(' ', '')
+					label = label.replace('.', '')
+					labels.append(label)
+			energy_list.append(energy)
+		print('Done!')
+		return energy_list, labels, lowest_energy_bitstring
+
+	def viz_solution_set(self, energy_for_set, labels, lowest_energy, title = '', sort = False):
+		"""
+		Visualize energy distribution for a set of protein configurations.
 		
-		plt.margins(0.2)
-		plt.gca().set_aspect('equal')
+		Creates a bar chart showing the energy values for different protein configurations,
+		with the optimal (lowest energy) configuration highlighted in green.
+		
+		Args:
+			energy_for_set: List of energy values for each configuration
+			labels: List of string labels for each configuration (typically bit strings)
+			lowest_energy: [best_config, index, energy] information for optimal solution
+			title (str, optional): Title prefix for the plot. Default: ''
+			sort (bool, optional): If True, sorts configurations by energy before plotting. Default: False
+			
+		Returns:
+			None: Displays matplotlib bar chart
+			
+		Note:
+			Uses seaborn styling with 18x4 inch figure size. X-axis labels are rotated 85 degrees
+			for readability. The configuration with lowest energy is highlighted in green.
+		"""
+		x = np.array(energy_for_set)
+
+		if sort:
+			sort_idx = x.argsort()
+			x = x[sort_idx]
+			labels = np.array(labels)[sort_idx]
+
+		fig, ax = plt.subplots(figsize=(18, 4))
+		plt.style.use("seaborn")
+		matplotlib.rc('xtick', labelsize=12)
+		ax.bar(range(len(energy_for_set)), x, tick_label = labels)
+
+		if not sort:
+			theoretical_lowest_idx = lowest_energy[1]
+			ax.get_xticklabels()[theoretical_lowest_idx].set_color("green")
+		else:
+			ax.get_xticklabels()[0].set_color("green")
+
+		plt.xlabel('Bitstrings')
+		plt.xticks(rotation=85)
+		plt.ylabel('Classic energy')
+		plt.title(r'Classic energy for ' + title + ' bitstrings')
+
+	def bit2coord(self, bit):
+		"""
+		Convert binary configuration to lattice coordinates.
+		
+		Extracts the (x, y) coordinates of occupied lattice sites from a binary
+		configuration array, enabling visualization and analysis of protein folding.
+		
+		Args:
+			bit: Binary array where bit[i] = 1 indicates amino acid placement
+				at the lattice position corresponding to bit_name_list[i]
+				
+		Returns:
+			Tuple[List[int], List[int]]: Two lists (x_coords, y_coords) containing
+				the lattice coordinates of all occupied sites
+				
+		Note:
+			Coordinates are extracted from self.bit_name_list which maps qubit indices
+			to (lattice_position, amino_acid_index) pairs.
+		"""
+		x = []
+		y = []
+		for i in range(len(bit)):
+			if int(bit[i]):
+				x.append(self.bit_name_list[i][0][0])
+				y.append(self.bit_name_list[i][0][1])
+		return x, y
+
+	def viz_lattice(self, bit):
+		"""
+		Visualize a protein configuration on the 2D lattice.
+		
+		Creates a scatter plot showing the protein folding configuration with:
+		- Grey background dots indicating all available lattice sites
+		- Connected colored dots showing the protein backbone
+		- Color coding based on amino acid type (H=hydrophobic, P=polar)
+		
+		Args:
+			bit: Binary array representing protein configuration where
+				bit[i] = 1 indicates amino acid placement at the lattice position
+				corresponding to bit_name_list[i]
+				
+		Returns:
+			None: Displays matplotlib scatter plot with connected backbone
+			
+		Note:
+			Uses 'coolwarm' colormap for amino acid types and draws connecting lines
+			between consecutive amino acids. Grid is shown with major tick marks
+			at unit intervals.
+		"""
+		x_grid = range(self.dim_lattice[0])
+		x_grid = [-x for x in x_grid]
+		y_grid = range(self.dim_lattice[0])
+		protein_grid = [0] * self.dim_lattice[0]
+
+		plt.scatter(y_grid, x_grid, c=protein_grid, cmap='Greys', s=10)
+
+		x, y = self.bit2coord(bit)
+		#x = [0, 0, 1, 1]
+		x = [-x for x in x]
+		#y = [0, 1, 1, 0]
+		
+		plt.plot(y, x, 'k-', zorder=0)  # straight lines
+		# large dots, set zorder=3 to draw the dots on top of the lines
+		plt.scatter(y, x, c=self.sequence, cmap='coolwarm', s=1500, zorder=3) 
+
+		plt.margins(0.2) # enough margin so that the large scatter dots don't touch the borders
+		plt.gca().set_aspect('equal') # equal distances in x and y direction
+
 		plt.axis('on')
-		
 		ax = plt.gca()
 		ax.xaxis.set_major_locator(MultipleLocator(1))
 		ax.xaxis.set_major_formatter(NullFormatter())
@@ -615,12 +940,10 @@ class CoordinateBased_HPLattice:
 		ax.yaxis.set_major_formatter(NullFormatter())
 		ax.tick_params(axis='both', length=0)
 		plt.grid(True, ls=':')
-		plt.title(f'Protein Configuration: {bit}')
-		
-		# Add amino acid indices
+		plt.title(str(bit))
+
 		for i in range(len(self.sequence)):
-			plt.annotate(i, (y[i], x[i]), color='white', fontsize=24, 
-						weight='bold', ha='center')
+			plt.annotate(i, (y[i], x[i]), color='white', fontsize=24, weight='bold', ha='center')
 
 
 # =============================================================================
@@ -752,8 +1075,7 @@ def plot_probs_with_energy(probs: np.ndarray, num_qubits: int, H_cost: Any,
 		now = datetime.now()
 		date_time = now.strftime("%m_%d_%Y")
 		plt.savefig(f'{name}_probs_with_energy_{date_time}.pdf')
-	
-	plt.show()
+
 	return fig
 
 def energies_of_set(_set: Union[List[np.ndarray], List[int]], H_cost: Any, num_qubits: int) -> np.ndarray:
@@ -982,18 +1304,12 @@ def get_ground_states_energy_and_indices(feasible_set: List[np.ndarray], H_cost:
 		- Handles degenerate ground states by returning all optimal indices
 	"""
 	# Calculate energies for all feasible states
-	feasible_energies = []
-	for state in feasible_set:
-		# Convert bit array to index
-		index = int(''.join(map(str, state.astype(int))), 2)
-		energy = energy_of_index(index, H_cost)
-		feasible_energies.append(energy)
-	
-	feasible_energies = np.array(feasible_energies)
-	min_energy = np.min(feasible_energies)
-	ground_indices = np.where(feasible_energies == min_energy)[0]
-	
-	return min_energy, ground_indices
+	indices_of_feasible = bit_array_set2indices(feasible_set)
+	energies_of_feasible = energies_of_set(indices_of_feasible, H_cost, len(feasible_set[0]))
+	ground_energy = round(float(np.amin(energies_of_feasible)), 8) # just to avoid a weird 4 at the 20th decimal
+	ground_states_i = np.take(indices_of_feasible, np.where(energies_of_feasible <= ground_energy))[0]
+
+	return ground_energy, ground_states_i
 
 def grid_search(start_gamma: float, stop_gamma: float, num_points_gamma: int,
 				start_beta: float, stop_beta: float, num_points_beta: int,
@@ -1326,14 +1642,14 @@ def vec_grid_search_p2(start_gamma: float, stop_gamma: float, num_points_gamma: 
 	i = np.unravel_index(Z.argmin(), Z.shape)
 	
 	gamma1 = float(X1[i[0]])
-	gamma2 = float(X2[i[1]])
+	gamma2 = float(X1[i[1]])
 	beta1 = float(Y1[i[2]])
-	beta2 = float(Y2[i[3]])  # Fixed: was Y1[i[3]], should be Y2[i[3]]
+	beta2 = float(Y1[i[3]])
 
 	return np.array([[gamma1, gamma2], [beta1, beta2]]), Z
 
-def get_annealing_params(p: int, tau: float = 1.0, linear: bool = True, 
-						sine: bool = False, plot: bool = False, save: bool = False) -> np.ndarray:
+def get_annealing_params(p: int, annealing_time: float = 1.0, linear: bool = True, 
+						sine: bool = False, cosine: bool = False, plot: bool = False, save: bool = False) -> np.ndarray:
 	"""
 	Generate quantum annealing-inspired initial parameters for QAOA.
 	
@@ -1344,8 +1660,9 @@ def get_annealing_params(p: int, tau: float = 1.0, linear: bool = True,
 	
 	Args:
 		p (int): Number of QAOA layers (circuit depth)
-		tau (float, optional): Total annealing time parameter. Default: 1.0
+		annealing_time (float, optional): Total annealing time parameter. Default: 1.0
 		linear (bool, optional): Use linear annealing schedule. Default: True
+		cosine (bool, optional): Use cosine-based annealing schedule. Default: False
 		sine (bool, optional): Use sine-based annealing schedule. Default: False
 		plot (bool, optional): Whether to plot parameter evolution. Default: False
 		save (bool, optional): Whether to save parameters to file. Default: False
@@ -1359,6 +1676,7 @@ def get_annealing_params(p: int, tau: float = 1.0, linear: bool = True,
 	Annealing Schedules:
 		- Linear: B(s) = s, providing uniform parameter progression
 		- Sine: B(s) = tan(-π/2 + s*π), with rapid transitions at boundaries
+		- Cosine: B(s) = (cos(π + s*π) + 1)/2, with smoother transitions near boundaries
 		
 	Example:
 		>>> params = get_annealing_params(p=3, tau=1.5, linear=True)
@@ -1373,46 +1691,48 @@ def get_annealing_params(p: int, tau: float = 1.0, linear: bool = True,
 		
 	Note:
 		- Linear schedule often works well for initial optimization attempts
-		- Sine schedule provides more aggressive parameter changes near boundaries
+		- Trigonometric schedule provides more aggressive parameter changes near boundaries
 		- Output can be used directly as starting point for gradient-based optimization
 		- File saving uses comma-separated format compatible with most tools
+		- Sine schedule does not seem to be working
 	"""
+	if sum([linear, cosine, sine]) >= 2:
+		raise Exception('Choose one schedule')
+	if sum([linear, cosine, sine]) == 0:
+		raise Exception('Choose a schedule')
+
 	annealing_params = np.zeros((2, p))
-	
+	tau = annealing_time/p
 	if linear:
 		name = 'linear_'
-		B_function = lambda s: s
-		
 		for i in range(p):
-			s_mid = (i + 1 - 0.5) / p
-			s_end = (i + 1 + 0.5) / p if i < p - 1 else 1.0
-			
-			annealing_params[0, i] = tau * B_function(s_mid)
-			annealing_params[1, i] = -(tau / 2) * (
-				2 - B_function(s_end) - B_function(s_mid))
-		
-		# Adjust last beta parameter
-		annealing_params[1, p - 1] = -(tau / 2) * (1 - B_function((p - 0.5) / p))
-	
+			annealing_params[0,i] = tau * (i+1-0.5) / p # gamma  Trotterisation to 2nd order
+			annealing_params[1,i] = - tau * (1 - ((i+1)/p)) # beta
+		annealing_params[1,p-1] = - tau / (4*p) # Trotterisation to 2nd order
+
+	elif cosine:
+		name = 'cosine_'
+		B_function = lambda s : (np.cos(np.pi + (s)*np.pi) + 1)/2
+		for i in range(p):
+			annealing_params[0,i] = tau * B_function((i+1-0.5)/p)
+			annealing_params[1,i] = - (tau/2) * (2 - B_function((i+1+0.5)/p) - B_function((i+1-0.5)/p))
+		annealing_params[1,p-1] = - (tau/2) * (1-B_function((p-0.5)/p))
+
 	elif sine:
 		name = 'sine_'
-		B_function = lambda s: np.tan(-np.pi / 2 + s * np.pi)
-		
+		B_function = lambda s : np.tan(-np.pi/2 + (s)*np.pi)
 		for i in range(p):
-			s_mid = (i + 1 - 0.5) / p
-			s_end = (i + 1 + 0.5) / p if i < p - 1 else 1.0
-			
-			annealing_params[0, i] = tau * B_function(s_mid)
-			annealing_params[1, i] = -(tau / 2) * (
-				2 - B_function(s_end) - B_function(s_mid))
-		
-		annealing_params[1, p - 1] = -(tau / 2) * (1 - B_function((p - 0.5) / p))
-	
+			annealing_params[0,i] = tau * B_function((i+1-0.5)/p)
+			annealing_params[1,i] = - (tau/2) * (2 - B_function((i+1+0.5)/p) - B_function((i+1-0.5)/p))
+		annealing_params[1,p-1] = - (tau/2) * (1-B_function((p-0.5)/p))
+
+	if plot and not save:
+		raise Exception('Must save the parameters to be able to plot')
 	if save:
-		np.savetxt(f'{name}params.out', annealing_params, delimiter=',')
+		np.savetxt(name + '_params' +'.out', annealing_params, delimiter=',')
 		if plot:
-			plot_params(name, 1, p, save=True)
-	
+			plot_params(name, 1, p, save = True)
+
 	return annealing_params
 
 def interpolate_params(params: np.ndarray, only_last: bool = False, 
